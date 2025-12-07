@@ -1,0 +1,28 @@
+/* Reset basic spacing */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* Page background + base font */
+body {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background-color: #fff7e6; /* soft cream */
+}
+
+/* Let React control layout inside #root */
+#root {
+  min-height: 100vh;
+}
+
+/* Links inherit navbar/button colors by default */
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* Buttons use same font as body */
+button {
+  font-family: inherit;
+}
