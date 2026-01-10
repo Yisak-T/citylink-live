@@ -5,6 +5,7 @@ const jwt = require("jsonwebtoken");
 const axios = require("axios");
 const http = require("http");
 const { Server } = require("socket.io");
+const crypto = require("crypto"); // <-- for personal API tokens
 require("dotenv").config();
 
 const db = require("./db");
@@ -12,7 +13,7 @@ const db = require("./db");
 const app = express();
 const PORT = process.env.PORT || 5001;
 const JWT_SECRET = process.env.JWT_SECRET || "default_secret_key";
-const WEATHERSTACK_API_KEY = process.env.WEATHERSTACK_API_KEY;;
+const WEATHERSTACK_API_KEY = process.env.WEATHERSTACK_API_KEY;
 const NEWS_API_KEY = process.env.NEWS_API_KEY;
 
 const server = http.createServer(app);
@@ -71,6 +72,32 @@ function adminMiddleware(req, res, next) {
   next();
 }
 
+// ---------- API KEY Middleware (personal API for external integrations) ----------
+function apiKeyAuth(req, res, next) {
+  const apiKey = req.headers["x-api-key"];
+  if (!apiKey) {
+    return res
+      .status(401)
+      .json({ error: "No API key provided in x-api-key header" });
+  }
+
+  db.get(
+    "SELECT id, email, username, favorite_city, is_admin FROM users WHERE api_token = ?",
+    [apiKey],
+    (err, user) => {
+      if (err) {
+        console.error("DB apiKeyAuth error:", err);
+        return res.status(500).json({ error: "Database error" });
+      }
+      if (!user) {
+        return res.status(401).json({ error: "Invalid API key" });
+      }
+      req.user = user;
+      next();
+    }
+  );
+}
+
 // ---------- Auth Routes ----------
 
 // Register
@@ -102,10 +129,10 @@ app.post("/api/register", async (req, res) => {
       const saltRounds = 10;
       const password_hash = await bcrypt.hash(password, saltRounds);
 
-      // Insert user (default is_admin = 0)
+      // Insert user (default is_admin = 0, api_token = NULL)
       db.run(
-        "INSERT INTO users (email, password_hash, username, favorite_city, is_admin) VALUES (?, ?, ?, ?, ?)",
-        [email, password_hash, username, favorite_city || null, 0],
+        "INSERT INTO users (email, password_hash, username, favorite_city, is_admin, api_token) VALUES (?, ?, ?, ?, ?, ?)",
+        [email, password_hash, username, favorite_city || null, 0, null],
         function (err) {
           if (err) {
             console.error("DB insert error:", err);
@@ -263,6 +290,63 @@ app.delete("/api/profile", authMiddleware, (req, res) => {
       res.json({ message: "Account deleted" });
     });
   });
+});
+
+// ---------- Personal API Token Routes (for user external integration) ----------
+
+// Generate or regenerate personal API key
+app.post("/api/personal-api-token", authMiddleware, (req, res) => {
+  const userId = req.user.id;
+
+  // generate a random 32-byte hex token
+  const newToken = crypto.randomBytes(32).toString("hex");
+
+  db.run(
+    "UPDATE users SET api_token = ? WHERE id = ?",
+    [newToken, userId],
+    function (err) {
+      if (err) {
+        console.error("DB update api_token error:", err);
+        return res.status(500).json({ error: "Failed to generate API token" });
+      }
+
+      res.json({
+        message: "Personal API token generated",
+        api_token: newToken, // show full token only here
+      });
+    }
+  );
+});
+
+// Get info about existing API token (masked)
+app.get("/api/personal-api-token", authMiddleware, (req, res) => {
+  const userId = req.user.id;
+
+  db.get(
+    "SELECT api_token FROM users WHERE id = ?",
+    [userId],
+    (err, row) => {
+      if (err) {
+        console.error("DB read api_token error:", err);
+        return res.status(500).json({ error: "Failed to read API token" });
+      }
+
+      if (!row || !row.api_token) {
+        return res.json({ has_token: false });
+      }
+
+      const token = row.api_token;
+      const masked =
+        token.length > 8
+          ? token.slice(0, 4) + "..." + token.slice(-4)
+          : "********";
+
+      res.json({
+        has_token: true,
+        masked_token: masked,
+      });
+    }
+  );
 });
 
 // ---------- Admin Routes ----------
@@ -478,6 +562,97 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log("User disconnected:", socket.id);
   });
+});
+
+// ---------- External-style endpoints using API key auth ----------
+
+// External: get own user info via x-api-key (no JWT)
+app.get("/api/external/me", apiKeyAuth, (req, res) => {
+  res.json({ user: req.user });
+});
+
+// External: get weather via x-api-key
+app.get("/api/external/cities/:city/weather", apiKeyAuth, async (req, res) => {
+  const city = req.params.city;
+
+  if (!WEATHERSTACK_API_KEY || WEATHERSTACK_API_KEY === "demo") {
+    return res.status(500).json({ error: "Weather API key not configured" });
+  }
+
+  try {
+    const url = `http://api.weatherstack.com/current?access_key=${WEATHERSTACK_API_KEY}&query=${encodeURIComponent(
+      city
+    )}&units=m`;
+
+    const response = await axios.get(url, { timeout: 5000 });
+    const data = response.data;
+
+    if (data.error) {
+      console.error("Weatherstack API error:", data.error);
+      const message = data.error.info || "Weather API error";
+      const code = data.error.code === 615 ? 404 : 500;
+      return res.status(code).json({ error: message });
+    }
+
+    const result = {
+      city: data.location?.name,
+      country: data.location?.country,
+      temperature: data.current?.temperature,
+      feels_like: data.current?.feelslike,
+      description: data.current?.weather_descriptions?.[0],
+      humidity: data.current?.humidity,
+      wind_speed: data.current?.wind_speed,
+    };
+
+    res.json(result);
+  } catch (error) {
+    console.error("External Weather API error:", error.message);
+    if (error.response) {
+      console.error("Weather API response data:", error.response.data);
+    }
+    res.status(500).json({ error: "Failed to fetch weather data" });
+  }
+});
+
+// External: get news via x-api-key
+app.get("/api/external/cities/:city/news", apiKeyAuth, async (req, res) => {
+  const city = req.params.city;
+
+  if (!NEWS_API_KEY || NEWS_API_KEY === "demo") {
+    return res.status(500).json({ error: "News API key not configured" });
+  }
+
+  try {
+    const url = `https://newsdata.io/api/1/news?apikey=${NEWS_API_KEY}&q=${encodeURIComponent(
+      city
+    )}&language=en`;
+
+    const response = await axios.get(url, { timeout: 5000 });
+    const data = response.data;
+
+    if (data.status !== "success") {
+      console.error("Newsdata API error:", data);
+      return res.status(500).json({ error: "Failed to fetch news" });
+    }
+
+    const articles = data.results || [];
+
+    const result = articles.slice(0, 5).map((a) => ({
+      title: a.title,
+      description: a.description,
+      url: a.link,
+      source: a.source_id || a.source || "Unknown",
+      publishedAt: a.pubDate || a.pub_date,
+    }));
+
+    res.json(result);
+  } catch (error) {
+    console.error("External News API error:", error.message);
+    if (error.response) {
+      console.error("News API response data:", error.response.data);
+    }
+    res.status(500).json({ error: "Failed to fetch news" });
+  }
 });
 
 // Start server
